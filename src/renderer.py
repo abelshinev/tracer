@@ -1,140 +1,110 @@
-import cv2
-import mediapipe as mp
-import time
-import os
-import urllib.request
-import threading
-from dataclasses import dataclass, field
-from typing import Dict, List, Any
+import sys
+import pygame
+import win32api
+import win32con
+import win32gui
+from vision import HandTracker
 
-# --- Independent Data Structures ---
-@dataclass
-class Hand:
-    handedness: str
-    landmarks: List[Any]  # Stores all 21 MediaPipe landmark objects
+# Initialize Pygame
+pygame.init()
+WIDTH, HEIGHT = 1780, 1080
+screen = pygame.display.set_mode((WIDTH, HEIGHT), pygame.NOFRAME)
+
+# Define Colors
+FUCHSIA = (255, 0, 128)
+DARK_GREEN = (0, 100, 0)
+NEON_GREEN = (0, 255, 0)
+CYAN = (0, 255, 255)
+WHITE = (255, 255, 255)
+BRUSH_COLOR = (0, 150, 255) # A nice glowing blue for the ink
+
+# Windows Transparency Magic
+hwnd = pygame.display.get_surface_id() if hasattr(pygame.display, 'get_surface_id') else pygame.display.get_wm_info()['window']
+current_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, current_style | win32con.WS_EX_LAYERED | win32con.WS_EX_TOPMOST)
+win32gui.SetLayeredWindowAttributes(hwnd, win32api.RGB(*FUCHSIA), 0, win32con.LWA_COLORKEY)
+
+font = pygame.font.SysFont("Arial", 20, bold=True)
+clock = pygame.time.Clock()
+
+# --- THE DRAWING CANVAS ---
+# This surface holds our permanent ink. We set its transparent color to Fuchsia.
+canvas = pygame.Surface((WIDTH, HEIGHT))
+canvas.fill(FUCHSIA)
+canvas.set_colorkey(FUCHSIA)
+
+tracker = HandTracker()
+running = True
+
+# We need to remember where the brush was last frame to draw smooth continuous lines
+prev_rx, prev_ry = None, None
+
+while running:
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT or (event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE):
+            running = False
+
+    # 1. Clear the main screen
+    screen.fill(FUCHSIA)
+
+    # 2. PULL DATA STATE
+    state = tracker.get_tracking_state()
     
-    @property
-    def index_tip(self):
-        return self.landmarks[8]
+    # 3. GET LEFT HAND STATE (The Commander)
+    left_gesture = "Unknown"
+    if "Left" in state.hands:
+        lh = state.hands["Left"]
+        left_gesture = lh.gesture
+        lx, ly = lh.get_pixel(8, WIDTH, HEIGHT)
         
-    @property
-    def thumb_tip(self):
-        return self.landmarks[4]
+        # Draw Left Hand UI
+        pygame.draw.rect(screen, CYAN, (lx - 25, ly - 25, 50, 50), 3, border_radius=5)
+        status_l = font.render(f"Left Mode: {left_gesture}", True, WHITE)
+        screen.blit(status_l, (lx - 40, ly - 50))
         
-    def get_pixel(self, landmark_idx, w, h):
-        """Safely scales normalized coordinates to the final canvas size."""
-        return int(self.landmarks[landmark_idx].x * w), int(self.landmarks[landmark_idx].y * h)
-        
-    @property
-    def gesture(self) -> str:
-        """Self-contained geometric gesture evaluation."""
-        index_up = self.landmarks[8].y < self.landmarks[6].y
-        middle_up = self.landmarks[12].y < self.landmarks[10].y
-        ring_up = self.landmarks[16].y < self.landmarks[14].y
-        pinky_up = self.landmarks[20].y < self.landmarks[18].y
+        # ACTION: Clear Canvas on Fist
+        if left_gesture == "Fist":
+            canvas.fill(FUCHSIA)
 
-        if index_up and not middle_up and not ring_up and not pinky_up:
-            return "Pointer"
-        elif index_up and middle_up and not ring_up and not pinky_up:
-            return "Arrow"
-        elif index_up and middle_up and ring_up and pinky_up:
-            return "Open"
-        elif not index_up and not middle_up and not ring_up and not pinky_up:
-            return "Fist"
+    # 4. GET RIGHT HAND STATE (The Brush)
+    if "Right" in state.hands:
+        rh = state.hands["Right"]
+        rx, ry = rh.get_pixel(8, WIDTH, HEIGHT)
+        
+        # ACTION: Draw on Canvas if Left Hand is Pointing
+        if left_gesture == "Pointer":
+            if prev_rx is not None and prev_ry is not None:
+                # Draw a thick anti-aliased line on the CANVAS, not the screen
+                pygame.draw.line(canvas, BRUSH_COLOR, (prev_rx, prev_ry), (rx, ry), 10)
+                # Cap the ends with circles so the line looks perfectly smooth
+                pygame.draw.circle(canvas, BRUSH_COLOR, (rx, ry), 5)
             
-        return "Unknown"
-
-@dataclass
-class TrackingState:
-    hands: Dict[str, Hand] = field(default_factory=dict)
-    timestamp_ms: int = 0
-
-# --- The Asynchronous Vision Engine ---
-class HandTracker:
-    def __init__(self, model_path='hand_landmarker.task'):
-        self.camera_index = 1  # OBS Virtual Camera
-        self.cap = cv2.VideoCapture(self.camera_index)
-        
-        if not self.cap.isOpened():
-            raise RuntimeError(f"CRITICAL: OpenCV could not connect to camera index {self.camera_index}.")
-
-        self.model_path = model_path
-        self._ensure_model_exists()
-        
-        # Dual Mailboxes
-        self.latest_frame = None
-        self.latest_state = TrackingState()
-        self.thread_running = True
-        
-        # Initialize MediaPipe (IMAGE Mode)
-        BaseOptions = mp.tasks.BaseOptions
-        HandLandmarker = mp.tasks.vision.HandLandmarker
-        HandLandmarkerOptions = mp.tasks.vision.HandLandmarkerOptions
-        VisionRunningMode = mp.tasks.vision.RunningMode
-
-        options = HandLandmarkerOptions(
-            base_options=BaseOptions(model_asset_path=self.model_path),
-            running_mode=VisionRunningMode.IMAGE,
-            num_hands=2
-        )
-        self.landmarker = HandLandmarker.create_from_options(options)
-
-        # Start background workers
-        self.cam_thread = threading.Thread(target=self._camera_loop, daemon=True)
-        self.inf_thread = threading.Thread(target=self._inference_loop, daemon=True)
-        self.cam_thread.start()
-        self.inf_thread.start()
-
-    def _ensure_model_exists(self):
-        if not os.path.exists(self.model_path):
-            url = "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task"
-            urllib.request.urlretrieve(url, self.model_path)
-
-    def _camera_loop(self):
-        """Thread 1: Feeds the frame mailbox."""
-        while self.thread_running:
-            success, frame = self.cap.read()
-            if success:
-                self.latest_frame = frame
-            else:
-                time.sleep(0.001)
-
-    def _inference_loop(self):
-        """Thread 2: Pulls frame, downscales, runs AI, feeds state mailbox."""
-        while self.thread_running:
-            if self.latest_frame is None:
-                time.sleep(0.001)
-                continue
-                
-            frame_to_process = self.latest_frame.copy()
+            # Brush Cursor (Solid when drawing)
+            pygame.draw.circle(screen, BRUSH_COLOR, (rx, ry), 15, 0)
+        else:
+            # Hover Cursor (Hollow when not drawing)
+            pygame.draw.circle(screen, NEON_GREEN, (rx, ry), 15, 2)
             
-            # OPTIMIZATION: Downscale by 3x to crush inference latency
-            small_frame = cv2.resize(frame_to_process, (640, 360))
-            
-            rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            
-            # Synchronous inference on the tiny image
-            result = self.landmarker.detect(mp_image)
+        # Save current position for the next frame's line drawing
+        prev_rx, prev_ry = rx, ry
+    else:
+        # If right hand is lost, break the continuous line
+        prev_rx, prev_ry = None, None
 
-            new_hands = {}
-            if result.hand_landmarks and result.handedness:
-                for landmarks, handedness_info in zip(result.hand_landmarks, result.handedness):
-                    handedness = handedness_info[0].category_name
-                    new_hands[handedness] = Hand(handedness=handedness, landmarks=landmarks)
+    # 5. COMPOSITE THE IMAGE
+    # Slap the permanent canvas onto the main screen
+    screen.blit(canvas, (0, 0))
 
-            self.latest_state = TrackingState(hands=new_hands, timestamp_ms=int(time.perf_counter() * 1000))
-            
-            # Yield slightly to prevent thread starvation
-            time.sleep(0.005) 
+    # Draw UI Header Box on top of everything
+    pygame.draw.rect(screen, DARK_GREEN, (10, 10, 350, 60), border_radius=10)
+    text_surface = font.render("[Phase 4: AR Whiteboard]", True, NEON_GREEN)
+    screen.blit(text_surface, (20, 15))
+    fps_surface = font.render(f"Renderer FPS: {int(clock.get_fps())}", True, WHITE)
+    screen.blit(fps_surface, (20, 40))
 
-    def get_tracking_state(self) -> TrackingState:
-        """O(1) Instant Return for Pygame (No blocking!)."""
-        return self.latest_state
+    pygame.display.update()
+    clock.tick(120)
 
-    def release(self):
-        self.thread_running = False
-        self.cam_thread.join(timeout=1.0)
-        self.inf_thread.join(timeout=1.0)
-        self.cap.release()
-        self.landmarker.close()
+tracker.release()
+pygame.quit()
+sys.exit()

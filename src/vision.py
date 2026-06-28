@@ -102,31 +102,36 @@ class HandTracker:
     def _inference_loop(self):
         """Thread 2: Pulls frame, downscales, runs AI, feeds state mailbox."""
         while self.thread_running:
-            if self.latest_frame is None:
-                time.sleep(0.001)
-                continue
+            try:
+                if self.latest_frame is None:
+                    time.sleep(0.001)
+                    continue
+                    
+                frame_to_process = self.latest_frame.copy()
                 
-            frame_to_process = self.latest_frame.copy()
-            
-            # OPTIMIZATION: Downscale by 3x to crush inference latency
-            small_frame = cv2.resize(frame_to_process, (640, 360))
-            
-            rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            
-            # Synchronous inference on the tiny image
-            result = self.landmarker.detect(mp_image)
+                # OPTIMIZATION: Downscale by 3x to crush inference latency
+                small_frame = cv2.resize(frame_to_process, (640, 360))
+                
+                rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+                
+                # Synchronous inference on the tiny image
+                result = self.landmarker.detect(mp_image)
 
-            new_hands = {}
-            if result.hand_landmarks and result.handedness:
-                for landmarks, handedness_info in zip(result.hand_landmarks, result.handedness):
-                    handedness = handedness_info[0].category_name
-                    new_hands[handedness] = Hand(handedness=handedness, landmarks=landmarks)
+                new_hands = {}
+                if result.hand_landmarks and result.handedness:
+                    for landmarks, handedness_info in zip(result.hand_landmarks, result.handedness):
+                        handedness = handedness_info[0].category_name
+                        new_hands[handedness] = Hand(handedness=handedness, landmarks=landmarks)
 
-            self.latest_state = TrackingState(hands=new_hands, timestamp_ms=int(time.perf_counter() * 1000))
-            
-            # Yield slightly to prevent thread starvation
-            time.sleep(0.005) 
+                self.latest_state = TrackingState(hands=new_hands, timestamp_ms=int(time.perf_counter() * 1000))
+                
+                # Yield slightly to prevent thread starvation
+                time.sleep(0.005) 
+                
+            except Exception as e:
+                print(f"[FATAL] Inference Thread Crashed: {e}")
+                time.sleep(1) # Prevent log spam on continuous failure
 
     def get_tracking_state(self) -> TrackingState:
         """O(1) Instant Return for Pygame (No blocking!)."""
