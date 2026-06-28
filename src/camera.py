@@ -20,7 +20,12 @@ class HandState:
 
 class HandTracker:
     def __init__(self, model_path='hand_landmarker.task'):
-        self.cap = cv2.VideoCapture(0)
+        # Try camera 0 first. If you have OBS, your real camera might be 1 or 2.
+        self.camera_index = 0
+        self.cap = cv2.VideoCapture(self.camera_index)
+        
+        if not self.cap.isOpened():
+            raise RuntimeError(f"CRITICAL: OpenCV could not connect to camera index {self.camera_index}. Check permissions or change the index.")
         self.model_path = model_path
         self._ensure_model_exists()
         
@@ -63,19 +68,23 @@ class HandTracker:
             self.current_state = HandState(False, 0, 0, "")
 
     def get_hand_state(self, screen_width: int, screen_height: int) -> HandState:
-        """Grabs a frame, passes it to the async engine, and returns the latest state."""
         success, frame = self.cap.read()
+        
         if not success:
+            print("WARNING: Camera connected but dropped a frame.")
             return HandState(False, 0, 0, "")
 
-        # Update dimensions dynamically so the callback tracks matching resolution targets
-        self.screen_dimensions = (screen_width, screen_height)
+        # --- DEBUG WINDOW ADDED HERE ---
+        # This forces a window to open so you can physically see the feed
+        cv2.imshow("Camera Debug Feed", frame)
+        cv2.waitKey(1) 
+        # -------------------------------
 
-        # Process frame alignment for MediaPipe input
+        self.screen_dimensions = (screen_width, screen_height)
+        
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
         
-        # Microsecond timestamp required for tracking continuity
         timestamp_ms = int(time.perf_counter() * 1000)
         self.landmarker.detect_async(mp_image, timestamp_ms)
 
